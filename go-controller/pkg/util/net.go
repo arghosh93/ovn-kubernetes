@@ -316,3 +316,14 @@ func StringsToIPs(ips []string) []net.IP {
 	}
 	return s
 }
+
+func SubnetContainsIP(subnets, ips []*net.IPNet) bool {
+	for _, subnet := range subnets {
+		for _, ip := range ips {
+			if utilnet.IPFamilyOf(subnet.IP) == utilnet.IPFamilyOf(ip.IP) && !subnet.Contains(ip.IP) {
+				return false
+			}
+		}
+	}
+	return true
+}
