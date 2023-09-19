@@ -11,6 +11,7 @@ import (
 	ipallocator "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/ip"
 	subnetipallocator "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/allocator/ip/subnet"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/config"
+	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kube"
 	"github.com/ovn-org/ovn-kubernetes/go-controller/pkg/kubevirt"
 	logicalswitchmanager "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/ovn/logical_switch_manager"
 	ovntypes "github.com/ovn-org/ovn-kubernetes/go-controller/pkg/types"
@@ -415,25 +416,36 @@ func (bnc *BaseNetworkController) getExpectedSwitchName(pod *kapi.Pod) (string, 
 // to the same virtual machine, for normal pods it will unmarshal and return
 // it, also there returned boolean will be true if the pod subnet belong to
 // controller's zone.
-func (bnc *BaseNetworkController) ensurePodAnnotation(pod *kapi.Pod, nadName string) (*util.PodAnnotation, bool, error) {
+func (bnc *BaseNetworkController) ensurePodAnnotation(pod *kapi.Pod, nadName string) (*util.PodAnnotation, bool, bool, error) {
+	var podIfAddrs []*net.IPNet
 	if kubevirt.IsPodLiveMigratable(pod) {
 		podAnnotation, err := kubevirt.EnsurePodAnnotationForVM(bnc.watchFactory, bnc.kube, pod, bnc.NetInfo, nadName)
 		if err != nil {
-			return nil, false, err
+			return nil, false, true, err
 		}
 		if podAnnotation == nil {
-			return nil, true, nil
+			return nil, true, true, nil
 		}
 		// The live migrated pods will have the pod annotation but the switch manager running
 		// at the node will not contain the switch as expected
 		_, zoneContainsPodSubnet := kubevirt.ZoneContainsPodSubnet(bnc.lsManager, podAnnotation)
-		return podAnnotation, zoneContainsPodSubnet, nil
+		return podAnnotation, zoneContainsPodSubnet, true, nil
 	}
 	podAnnotation, err := util.UnmarshalPodAnnotation(pod.Annotations, nadName)
 	if err != nil {
-		return nil, true, nil
+		return nil, true, true, nil
 	}
-	return podAnnotation, true, nil
+
+	// Check whether pod IP coexists to the host-subnet of the node where it has been scheduled.
+	// podIPBelongsToNodeSubnet is false only when above condition does not meet. allocatePodAnnotation
+	// tries to override pod-networks annotation going forward if podIPBelongsToNodeSubnet is false.
+	podIfAddrs = podAnnotation.IPs
+	switchSubnet := bnc.lsManager.GetSwitchSubnets(pod.Spec.NodeName)
+	podIPBelongsToNodeSubnet := util.SubnetContainsIP(switchSubnet, podIfAddrs)
+	if !podIPBelongsToNodeSubnet {
+		klog.Infof("POD IP %s does not belong to host-subnet %s of node %s, would reassign POD IP", podIfAddrs, switchSubnet, pod.Spec.NodeName)
+	}
+	return podAnnotation, true, podIPBelongsToNodeSubnet, nil
 }
 
 func (bnc *BaseNetworkController) addLogicalPortToNetwork(pod *kapi.Pod, nadName string,
@@ -757,7 +769,7 @@ func (bnc *BaseNetworkController) allocatePodAnnotation(pod *kapi.Pod, existingL
 
 	switchName := pod.Spec.NodeName
 
-	podAnnotation, zoneContainsPodSubnet, err := bnc.ensurePodAnnotation(pod, nadName)
+	podAnnotation, zoneContainsPodSubnet, podIPBelongsToNodeSubnet, err := bnc.ensurePodAnnotation(pod, nadName)
 	if err != nil {
 		return nil, false, fmt.Errorf("unable to ensure pod annotation: %v", err)
 	}
@@ -780,20 +792,47 @@ func (bnc *BaseNetworkController) allocatePodAnnotation(pod *kapi.Pod, existingL
 		}
 	}()
 
+	needsNewMacOrIPAllocation := false
+
+	// If podIPBelongsToNodeSubnet is false then set pod-networks annotation to `nil` and set needsNewMacOrIPAllocation.
+	// to `true` to force new IP allocation and override the annotation going forward. It also releases the IP if any
+	// node is using the subnet. CNIAdd should take care of updating pod IP upon next node reboot.
 	if podAnnotation != nil {
 		podMac = podAnnotation.MAC
 		podIfAddrs = podAnnotation.IPs
 
 		if bnc.doesNetworkRequireIPAM() {
-			if zoneContainsPodSubnet {
+			if zoneContainsPodSubnet && podIPBelongsToNodeSubnet {
 				// ensure we have reserved the IPs in the annotation
 				if err = bnc.lsManager.AllocateIPs(switchName, podIfAddrs); err != nil && err != ipallocator.ErrAllocated {
 					return nil, false, fmt.Errorf("unable to ensure IPs allocated for already annotated pod: %s, IPs: %s, error: %v",
 						podDesc, util.JoinIPNetIPs(podIfAddrs, " "), err)
 				}
+			} else if !podIPBelongsToNodeSubnet {
+				kclient := kube.Kube{KClient: bnc.CommonNetworkControllerInfo.client}
+				podAnnotator := kube.NewPodAnnotator(&kclient, pod.Name, pod.Namespace)
+				podAnnotator.Delete(util.OvnPodAnnotationName)
+				klog.Infof("removing pod-networks annotation from pod %s as current pod IP %s does not belong to host-subnet of the node %s", pod.Name, podAnnotation.IPs, pod.Spec.NodeName)
+				err := podAnnotator.Run()
+				if err != nil {
+					klog.Errorf("error removing pod annotation: err: %s", err)
+				}
+				needsNewMacOrIPAllocation = true
+				getSwitchName, exists := bnc.lsManager.GetSubnetName(podIfAddrs)
+				if !exists {
+					klog.V(5).Infof("no node have host subnet %s , no need to release IP", util.JoinIPNetIPs(podIfAddrs, " "))
+				} else {
+					relErr := bnc.lsManager.ReleaseIPs(getSwitchName, podIfAddrs)
+					if relErr != nil {
+						klog.Errorf("Error when releasing IPs %s for switch: %s, err: %q",
+							util.JoinIPNetIPs(podIfAddrs, " "), switchName, relErr)
+					} else {
+						klog.Infof("Released IPs: %s for node: %s", util.JoinIPNetIPs(podIfAddrs, " "), getSwitchName)
+					}
+				}
+			} else if !zoneContainsPodSubnet && podIPBelongsToNodeSubnet {
+				return podAnnotation, false, nil
 			}
-			return podAnnotation, false, nil
-
 		} else if len(podIfAddrs) > 0 {
 			return nil, false, fmt.Errorf("IPAMless network with IPs present in the annotations; rejecting to handle this request")
 		}
@@ -811,8 +850,15 @@ func (bnc *BaseNetworkController) allocatePodAnnotation(pod *kapi.Pod, existingL
 			return nil, false, fmt.Errorf("failed to get pod addresses for pod %s on node: %s, err: %v",
 				podDesc, switchName, err)
 		}
+		// corner case: switch port exists but the port IP does not belong to host-subnet of the node/switch.
+		// Do not reserve IP in that case and continue assigning new IP and MAC.
+		switchSubnet := bnc.lsManager.GetSwitchSubnets(switchName)
+		podIPBelongsToNodeSubnet = util.SubnetContainsIP(switchSubnet, podIfAddrs)
+		if !podIPBelongsToNodeSubnet {
+			podIfAddrs = []*net.IPNet{}
+			podMac = net.HardwareAddr{}
+		}
 	}
-	needsNewMacOrIPAllocation := false
 
 	// ensure we have reserved the IPs found in OVN
 	if len(podIfAddrs) == 0 {

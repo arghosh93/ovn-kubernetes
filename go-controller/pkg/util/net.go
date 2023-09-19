@@ -326,3 +326,16 @@ func StringsToIPs(ips []string) []net.IP {
 	}
 	return s
 }
+
+// Given two slice of IPNet, this function determines whether IPs of second
+// slice are from subnet of first slice or not
+func SubnetContainsIP(subnets, ips []*net.IPNet) bool {
+	for _, subnet := range subnets {
+		for _, ip := range ips {
+			if utilnet.IPFamilyOf(subnet.IP) == utilnet.IPFamilyOf(ip.IP) && !subnet.Contains(ip.IP) {
+				return false
+			}
+		}
+	}
+	return true
+}
