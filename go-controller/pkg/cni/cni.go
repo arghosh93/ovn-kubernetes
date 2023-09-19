@@ -144,6 +144,9 @@ func (pr *PodRequest) cmdAdd(kubeAuth *KubeAPIAuth, clientset *ClientSet) (*Resp
 		return nil, err
 	}
 
+	// If the POD IP does not coexist to host subnet then return error and wait for ovnkube-master
+	// to set correct annotation. ensurePodAnnotation, a method of receiver BaseNetworkController
+	// tries to validate this and override pod-networks annoatation of the POD.
 	podSpec, err := kubecli.GetPod(namespace, podName)
 	if err != nil {
 		return nil, err
@@ -157,14 +160,9 @@ func (pr *PodRequest) cmdAdd(kubeAuth *KubeAPIAuth, clientset *ClientSet) (*Resp
 		return nil, err
 	}
 	if !util.SubnetContainsIP(nodeSubnet, podNADAnnotation.IPs) {
-		/*
-			klog.Infof("pod IP %s does not belog to host subnet %s of node %s", podNADAnnotation.IPs, nodeSubnet, podSpec.Spec.NodeName)
-			if err = checkPodIPBelongsToNodeSubnet(pr.ctx, kubecli, podSpec.Spec.NodeName, pr.netName, podNADAnnotation); err != nil {
-				return nil, fmt.Errorf("failed while waiting for correct pod annotation: %v", err)
-			}
-		*/
 		return nil, fmt.Errorf("pod IP %s does not belog to host subnet %s of node %s", podNADAnnotation.IPs, nodeSubnet, podSpec.Spec.NodeName)
 	}
+
 	podInterfaceInfo.SkipIPConfig = kubevirt.IsPodLiveMigratable(pod)
 
 	response := &Response{KubeAuth: kubeAuth}
