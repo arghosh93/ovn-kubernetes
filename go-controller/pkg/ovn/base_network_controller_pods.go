@@ -438,12 +438,12 @@ func (bnc *BaseNetworkController) ensurePodAnnotation(pod *kapi.Pod, nadName str
 
 	// Check whether pod IP coexists to the host-subnet of the node where it has been scheduled.
 	// podIPBelongsToNodeSubnet is false only when above condition does not meet. allocatePodAnnotation
-	// tries to override pod-networks annotation going forward if podIPBelongsToNodeSubnet is false.
+	// method tries to override pod-networks annotation going forward if podIPBelongsToNodeSubnet is false.
 	podIfAddrs = podAnnotation.IPs
 	switchSubnet := bnc.lsManager.GetSwitchSubnets(pod.Spec.NodeName)
 	podIPBelongsToNodeSubnet := util.SubnetContainsIP(switchSubnet, podIfAddrs)
 	if !podIPBelongsToNodeSubnet {
-		klog.Infof("POD IP %s does not belong to host-subnet %s of node %s, would reassign POD IP", podIfAddrs, switchSubnet, pod.Spec.NodeName)
+		klog.Errorf("pod %s with IP %s does not belong to host-subnet %s of node %s, would reassign pod IP", pod.Name, podIfAddrs, switchSubnet, pod.Spec.NodeName)
 	}
 	return podAnnotation, true, podIPBelongsToNodeSubnet, nil
 }
@@ -794,9 +794,9 @@ func (bnc *BaseNetworkController) allocatePodAnnotation(pod *kapi.Pod, existingL
 
 	needsNewMacOrIPAllocation := false
 
-	// If podIPBelongsToNodeSubnet is false then set pod-networks annotation to `nil` and set needsNewMacOrIPAllocation.
-	// to `true` to force new IP allocation and override the annotation going forward. It also releases the IP if any
-	// node is using the subnet. CNIAdd should take care of updating pod IP upon next node reboot.
+	// If podIPBelongsToNodeSubnet is false then set pod-networks annotation to nil and set needsNewMacOrIPAllocation
+	// to true to force new IP allocation and override the annotation going forward. It also releases the IP if any
+	// node is using the subnet.
 	if podAnnotation != nil {
 		podMac = podAnnotation.MAC
 		podIfAddrs = podAnnotation.IPs

@@ -160,7 +160,7 @@ func (pr *PodRequest) cmdAdd(kubeAuth *KubeAPIAuth, clientset *ClientSet) (*Resp
 		return nil, err
 	}
 	if !util.SubnetContainsIP(nodeSubnet, podNADAnnotation.IPs) {
-		return nil, fmt.Errorf("pod IP %s does not belog to host subnet %s of node %s", podNADAnnotation.IPs, nodeSubnet, podSpec.Spec.NodeName)
+		return nil, fmt.Errorf("pod %s with IP %s does not belong to host subnet %s of node %s", podName, podNADAnnotation.IPs, nodeSubnet, podSpec.Spec.NodeName)
 	}
 
 	podInterfaceInfo.SkipIPConfig = kubevirt.IsPodLiveMigratable(pod)
