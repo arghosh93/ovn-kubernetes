@@ -661,9 +661,13 @@ ovs-server() {
   if [ ${ovs_user_id:-XX} != "XX" ]; then
     USER_ARGS="--ovs-user=${ovs_user_id}"
   fi
-
   /usr/share/openvswitch/scripts/ovs-ctl start --no-ovs-vswitchd \
     --system-id=random ${ovs_options} ${USER_ARGS} "$@"
+
+  # Reduce stack size to 2M from default 8M as per below commit on Openvswitch
+  # https://github.com/openvswitch/ovs/commit/b82a90e266e1246fe2973db97c95df22558174ea
+  # added while troubleshooting on https://bugzilla.redhat.com/show_bug.cgi?id=1572797
+  ulimit -s 2048
 
   /usr/share/openvswitch/scripts/ovs-ctl start --no-ovsdb-server \
     --system-id=random ${ovs_options} ${USER_ARGS} "$@"
@@ -672,11 +676,6 @@ ovs-server() {
     echo "Warning: Higher memory allocation by ovs-vswitchd is expected due to high number of n-handler-threads and n-revalidator-threads"
   fi
 
-  # Reduce stack size to 2M from default 8M as per below commit on Openvswitch
-  # https://github.com/openvswitch/ovs/commit/b82a90e266e1246fe2973db97c95df22558174ea
-  # added while troubleshooting on https://bugzilla.redhat.com/show_bug.cgi?id=1572797 
-  ulimit -s 2048
-  
   tail --follow=name ${OVS_LOGDIR}/ovs-vswitchd.log ${OVS_LOGDIR}/ovsdb-server.log &
   ovs_tail_pid=$!
   sleep 10
