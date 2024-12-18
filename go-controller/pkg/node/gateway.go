@@ -472,6 +472,13 @@ func (g *gateway) SetPodNetworkAdvertised(isPodNetworkAdvertised bool) {
 	g.isPodNetworkAdvertisedLock.Lock()
 	defer g.isPodNetworkAdvertisedLock.Unlock()
 	g.isPodNetworkAdvertised = isPodNetworkAdvertised
+	if g.openflowManager != nil {
+		for netName, netConfig := range g.openflowManager.defaultBridge.netConfig {
+			if netName == types.DefaultNetworkName {
+				netConfig.isUDNNetworkAdvertised = isPodNetworkAdvertised
+			}
+		}
+	}
 }
 
 // Reconcile handles triggering updates to different components of a gateway, like OFM, Services
@@ -485,7 +492,7 @@ func (g *gateway) Reconcile() error {
 	if err != nil {
 		return fmt.Errorf("failed to get subnets for node: %s for OpenFlow cache update; err: %w", node.Name, err)
 	}
-	if err := g.openflowManager.updateBridgeFlowCache(subnets, g.nodeIPManager.ListAddresses(), g.isPodNetworkAdvertised); err != nil {
+	if err := g.openflowManager.updateBridgeFlowCache(subnets, g.nodeIPManager.ListAddresses(), g.isPodNetworkAdvertised, false); err != nil {
 		return err
 	}
 	err = g.updateSNATRules()
@@ -588,6 +595,7 @@ func (b *bridgeConfiguration) updateInterfaceIPAddresses(node *kapi.Node) ([]*ne
 func bridgeForInterface(intfName, nodeName, physicalNetworkName string, gwIPs []*net.IPNet) (*bridgeConfiguration, error) {
 	defaultNetConfig := &bridgeUDNConfiguration{
 		masqCTMark: ctMarkOVN,
+		subnets:    config.Default.ClusterSubnets,
 	}
 	res := bridgeConfiguration{
 		nodeName: nodeName,
