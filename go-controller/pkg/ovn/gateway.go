@@ -889,7 +889,7 @@ func (gw *GatewayManager) updateGWRouterNAT(nodeName string, gwConfig *GatewayCo
 			addressSetFactory := addressset.NewOvnAddressSetFactory(gw.nbClient, config.IPv4Mode, config.IPv6Mode)
 			// Use the correct controller name: default-network-controller for default network,
 			// <networkName>-network-controller for user-defined networks
-			controllerName := DefaultNetworkControllerName
+			controllerName := types.DefaultNetworkControllerName
 			if gw.netInfo.IsUserDefinedNetwork() {
 				controllerName = getNetworkControllerName(gw.netInfo.GetNetworkName())
 			}

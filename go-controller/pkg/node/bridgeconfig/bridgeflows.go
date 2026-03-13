@@ -132,7 +132,22 @@ func (b *BridgeConfiguration) flowsForDefaultBridge(extraIPs []net.IP) ([]string
 			}
 		}
 
-		// table 0, Reply SVC traffic from Host -> OVN, unSNAT and goto table 5
+		// table 0, Reply SVC traffic from Host -> OVN for no-overlay UDNs in local gateway mode
+		// Match network-specific masquerade IP, unSNAT and goto table 5
+		// The ct_mark was set in the outbound flow and will be used in table 2 for routing
+		if config.Gateway.Mode == config.GatewayModeLocal {
+			for _, netConfig := range b.patchedNetConfigs() {
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					dftFlows = append(dftFlows,
+						fmt.Sprintf("cookie=%s, priority=501, in_port=%s, %s, %s_dst=%s, "+
+							"actions=ct(zone=%d,nat,table=5)",
+							nodetypes.DefaultOpenFlowCookie, ofPortHost, protoPrefixV4, protoPrefixV4,
+							netConfig.V4MasqIPs.GatewayRouter.IP, config.Default.OVNMasqConntrackZone))
+				}
+			}
+		}
+
+		// table 0, Reply SVC traffic from Host -> OVN (default network), unSNAT and goto table 5
 		dftFlows = append(dftFlows,
 			fmt.Sprintf("cookie=%s, priority=500, in_port=%s, %s, %s_dst=%s,"+
 				"actions=ct(zone=%d,nat,table=5)",
@@ -197,7 +212,22 @@ func (b *BridgeConfiguration) flowsForDefaultBridge(extraIPs []net.IP) ([]string
 			}
 		}
 
-		// table 0, Reply SVC traffic from Host -> OVN, unSNAT and goto table 5
+		// table 0, Reply SVC traffic from Host -> OVN for no-overlay UDNs in local gateway mode
+		// Match network-specific masquerade IP, unSNAT and goto table 5
+		// The ct_mark was set in the outbound flow and will be used in table 2 for routing
+		if config.Gateway.Mode == config.GatewayModeLocal {
+			for _, netConfig := range b.patchedNetConfigs() {
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					dftFlows = append(dftFlows,
+						fmt.Sprintf("cookie=%s, priority=501, in_port=%s, %s, %s_dst=%s, "+
+							"actions=ct(zone=%d,nat,table=5)",
+							nodetypes.DefaultOpenFlowCookie, ofPortHost, protoPrefixV6, protoPrefixV6,
+							netConfig.V6MasqIPs.GatewayRouter.IP, config.Default.OVNMasqConntrackZone))
+				}
+			}
+		}
+
+		// table 0, Reply SVC traffic from Host -> OVN (default network), unSNAT and goto table 5
 		dftFlows = append(dftFlows,
 			fmt.Sprintf("cookie=%s, priority=500, in_port=%s, %s, %s_dst=%s,"+
 				"actions=ct(zone=%d,nat,table=5)",
@@ -414,6 +444,17 @@ func (b *BridgeConfiguration) flowsForDefaultBridge(extraIPs []net.IP) ([]string
 					"actions=set_field:%s->eth_dst,%soutput:%s",
 					nodetypes.DefaultOpenFlowCookie, protoPrefixV4, netConfig.PktMark,
 					bridgeMacAddress, mod_vlan_id, netConfig.OfPortPatch))
+
+			// For no-overlay UDNs in local gateway mode, also route based on ct_mark
+			// This handles return traffic from hairpinned NodePort services
+			if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay &&
+				config.Gateway.Mode == config.GatewayModeLocal {
+				dftFlows = append(dftFlows,
+					fmt.Sprintf("cookie=%s, priority=250, table=2, ct_state=+trk, ct_mark=%s, %s, "+
+						"actions=set_field:%s->eth_dst,%soutput:%s",
+						nodetypes.DefaultOpenFlowCookie, netConfig.MasqCTMark, protoPrefixV4,
+						bridgeMacAddress, mod_vlan_id, netConfig.OfPortPatch))
+			}
 		}
 	}
 
@@ -451,6 +492,17 @@ func (b *BridgeConfiguration) flowsForDefaultBridge(extraIPs []net.IP) ([]string
 					"actions=set_field:%s->eth_dst,%soutput:%s",
 					nodetypes.DefaultOpenFlowCookie, protoPrefixV6, netConfig.PktMark,
 					bridgeMacAddress, mod_vlan_id, netConfig.OfPortPatch))
+
+			// For no-overlay UDNs in local gateway mode, also route based on ct_mark
+			// This handles return traffic from hairpinned NodePort services
+			if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay &&
+				config.Gateway.Mode == config.GatewayModeLocal {
+				dftFlows = append(dftFlows,
+					fmt.Sprintf("cookie=%s, priority=250, table=2, ct_state=+trk, ct_mark=%s, %s, "+
+						"actions=set_field:%s->eth_dst,%soutput:%s",
+						nodetypes.DefaultOpenFlowCookie, netConfig.MasqCTMark, protoPrefixV6,
+						bridgeMacAddress, mod_vlan_id, netConfig.OfPortPatch))
+			}
 		}
 	}
 
@@ -602,6 +654,30 @@ func (b *BridgeConfiguration) commonFlows(hostSubnets []*net.IPNet) ([]string, e
 		}
 		if ofPortPhys != "" {
 			for _, netConfig := range b.patchedNetConfigs() {
+				// table0, for UDN no-overlay networks, handle cross-node traffic
+				// that has already been SNATed to node IP by the gateway router.
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					if config.Gateway.Mode == config.GatewayModeShared {
+						// In shared gateway mode, commit to conntrack and send directly to physical port.
+						dftFlows = append(dftFlows,
+							fmt.Sprintf("cookie=%s, priority=99, in_port=%s, dl_src=%s, %s, nw_src=%s, "+
+								"actions=ct(commit, zone=%d, exec(set_field:%s->ct_mark)), output:%s",
+								nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch, bridgeMacAddress, protoPrefixV4,
+								physicalIP.IP, config.Default.ConntrackZone,
+								netConfig.MasqCTMark, ofPortPhys))
+					} else if config.Gateway.Mode == config.GatewayModeLocal {
+						// In local gateway mode, NAT to network-specific masquerade IP, set ct_mark, and send to LOCAL.
+						// Priority 175 flows are skipped for no-overlay UDNs, so this flow will match.
+						// ct_mark is used in table 2 for routing return traffic to the correct patch port.
+						dftFlows = append(dftFlows,
+							fmt.Sprintf("cookie=%s, priority=99, in_port=%s, dl_src=%s, %s, nw_src=%s, "+
+								"actions=ct(commit, zone=%d, nat(src=%s), exec(set_field:%s->ct_mark)), output:%s",
+								nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch, bridgeMacAddress, protoPrefixV4,
+								physicalIP.IP, config.Default.OVNMasqConntrackZone,
+								netConfig.V4MasqIPs.GatewayRouter.IP, netConfig.MasqCTMark, nodetypes.OvsLocalPort))
+					}
+				}
+
 				// table0, packets coming from egressIP pods that have mark 1008 on them
 				// will be SNAT-ed a final time into nodeIP to maintain consistency in traffic even if the GR
 				// SNATs these into egressIP prior to reaching external bridge.
@@ -663,6 +739,10 @@ func (b *BridgeConfiguration) commonFlows(hostSubnets []*net.IPNet) ([]string, e
 		}
 		if config.Gateway.Mode == config.GatewayModeLocal {
 			for _, netConfig := range b.patchedNetConfigs() {
+				// Skip no-overlay UDNs - they have dedicated priority 99 flows
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					continue
+				}
 				// table 0, any packet coming from OVN send to host in LGW mode, host will take care of sending it outside if needed.
 				// exceptions are traffic for egressIP and egressGW features and ICMP related traffic which will hit the priority 100 flow instead of this.
 				dftFlows = append(dftFlows,
@@ -703,6 +783,30 @@ func (b *BridgeConfiguration) commonFlows(hostSubnets []*net.IPNet) ([]string, e
 		}
 		if ofPortPhys != "" {
 			for _, netConfig := range b.patchedNetConfigs() {
+				// table0, for UDN no-overlay networks, handle cross-node traffic
+				// that has already been SNATed to node IP by the gateway router.
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					if config.Gateway.Mode == config.GatewayModeShared {
+						// In shared gateway mode, commit to conntrack and send directly to physical port.
+						dftFlows = append(dftFlows,
+							fmt.Sprintf("cookie=%s, priority=99, in_port=%s, dl_src=%s, %s, %s_src=%s, "+
+								"actions=ct(commit, zone=%d, exec(set_field:%s->ct_mark)), output:%s",
+								nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch, bridgeMacAddress, protoPrefixV6,
+								protoPrefixV6, physicalIP.IP, config.Default.ConntrackZone,
+								netConfig.MasqCTMark, ofPortPhys))
+					} else if config.Gateway.Mode == config.GatewayModeLocal {
+						// In local gateway mode, NAT to network-specific masquerade IP, set ct_mark, and send to LOCAL.
+						// Priority 175 flows are skipped for no-overlay UDNs, so this flow will match.
+						// ct_mark is used in table 2 for routing return traffic to the correct patch port.
+						dftFlows = append(dftFlows,
+							fmt.Sprintf("cookie=%s, priority=99, in_port=%s, dl_src=%s, %s, %s_src=%s, "+
+								"actions=ct(commit, zone=%d, nat(src=%s), exec(set_field:%s->ct_mark)), output:%s",
+								nodetypes.DefaultOpenFlowCookie, netConfig.OfPortPatch, bridgeMacAddress, protoPrefixV6,
+								protoPrefixV6, physicalIP.IP, config.Default.OVNMasqConntrackZone,
+								netConfig.V6MasqIPs.GatewayRouter.IP, netConfig.MasqCTMark, nodetypes.OvsLocalPort))
+					}
+				}
+
 				// table0, packets coming from egressIP pods that have mark 1008 on them
 				// will be DNAT-ed a final time into nodeIP to maintain consistency in traffic even if the GR
 				// DNATs these into egressIP prior to reaching external bridge.
@@ -765,6 +869,10 @@ func (b *BridgeConfiguration) commonFlows(hostSubnets []*net.IPNet) ([]string, e
 		}
 		if config.Gateway.Mode == config.GatewayModeLocal {
 			for _, netConfig := range b.patchedNetConfigs() {
+				// Skip no-overlay UDNs - they have dedicated priority 99 flows
+				if !netConfig.IsDefaultNetwork() && netConfig.Transport == types.NetworkTransportNoOverlay {
+					continue
+				}
 				// table 0, any packet coming from OVN send to host in LGW mode, host will take care of sending it outside if needed.
 				// exceptions are traffic for egressIP and egressGW features and ICMP related traffic which will hit the priority 100 flow instead of this.
 				dftFlows = append(dftFlows,
