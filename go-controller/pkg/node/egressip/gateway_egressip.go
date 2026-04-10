@@ -210,6 +210,17 @@ func (g *BridgeEIPAddrManager) GetCache() *MarkIPsCache {
 	return g.cache
 }
 
+// GetNodeName returns the node name this manager is configured for
+func (g *BridgeEIPAddrManager) GetNodeName() string {
+	return g.nodeName
+}
+
+// DeleteIPFromBridge removes an IP from the bridge interface without updating annotations.
+// This is used during fast shutdown to quickly remove IPs from the interface.
+func (g *BridgeEIPAddrManager) DeleteIPFromBridge(ip net.IP) error {
+	return g.deleteIPBridge(ip)
+}
+
 func (g *BridgeEIPAddrManager) AddEgressIP(eip *egressipv1.EgressIP) (bool, error) {
 	ip, pktMark, shouldSkip, err := g.parseAndValidateEIP(eip)
 	if err != nil {

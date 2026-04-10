@@ -63,6 +63,13 @@ func (netConfig *BridgeUDNConfiguration) setOfPatchPort() error {
 	return nil
 }
 
+// dropFlowConfig tracks which types of drop flows should be installed on the bridge
+type dropFlowConfig struct {
+	dropGARP        bool
+	dropEgressIPARP bool
+	egressIPs       []net.IP // egress IPs for which to drop ARP requests
+}
+
 type BridgeConfiguration struct {
 	mutex sync.Mutex
 
@@ -76,13 +83,13 @@ type BridgeConfiguration struct {
 	interfaceID string
 
 	// variables that can be updated (read/write access should be done with mutex held)
-	ofPortHost string
-	ips        []*net.IPNet
-	macAddress net.HardwareAddr
-	ofPortPhys string
-	netConfig  map[string]*BridgeUDNConfiguration
-	eipMarkIPs *egressip.MarkIPsCache
-	dropGARP   bool
+	ofPortHost  string
+	ips         []*net.IPNet
+	macAddress  net.HardwareAddr
+	ofPortPhys  string
+	netConfig   map[string]*BridgeUDNConfiguration
+	eipMarkIPs  *egressip.MarkIPsCache
+	dropFlowCfg dropFlowConfig
 }
 
 func NewBridgeConfiguration(intfName, nodeName,
@@ -117,7 +124,7 @@ func NewBridgeConfiguration(intfName, nodeName,
 	if config.OVNKubernetesFeature.EnableEgressIP && config.OVNKubernetesFeature.EnableInterconnect && config.OvnKubeNode.Mode == types.NodeModeFull {
 		// drop by default - set to false later when ovnkube controller has sync'd and changes propagated to OVN southbound database
 		// we should also match on run mode here to ensure ovnkube controller + ovnkube node are running in the same process
-		res.dropGARP = true
+		res.dropFlowCfg.dropGARP = true
 	}
 	// end temp work around
 
@@ -510,6 +517,12 @@ func (b *BridgeConfiguration) GetOfPortHost() string {
 	return b.ofPortHost
 }
 
+func (b *BridgeConfiguration) GetOfPortPhys() string {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	return b.ofPortPhys
+}
+
 func (b *BridgeConfiguration) GetEIPMarkIPs() *egressip.MarkIPsCache {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
@@ -525,7 +538,20 @@ func (b *BridgeConfiguration) SetEIPMarkIPs(eipMarkIPs *egressip.MarkIPsCache) {
 func (b *BridgeConfiguration) SetDropGARP(drop bool) {
 	b.mutex.Lock()
 	defer b.mutex.Unlock()
-	b.dropGARP = drop
+	b.dropFlowCfg.dropGARP = drop
+}
+
+// SetDropEgressIPARP configures whether to drop ARP requests for egress IPs from physical interface.
+// This should only be called during graceful shutdown to prevent duplicate MAC responses.
+func (b *BridgeConfiguration) SetDropEgressIPARP(drop bool, egressIPs []net.IP) {
+	b.mutex.Lock()
+	defer b.mutex.Unlock()
+	b.dropFlowCfg.dropEgressIPARP = drop
+	if drop {
+		b.dropFlowCfg.egressIPs = egressIPs
+	} else {
+		b.dropFlowCfg.egressIPs = nil
+	}
 }
 
 func gatewayReady(patchPort string) bool {

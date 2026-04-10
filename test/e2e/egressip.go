@@ -3727,3 +3727,299 @@ spec:
 		},
 	),
 )
+
+// Test for OCPBUGS-77068: Graceful shutdown with ARP drop flows
+// This test verifies that during graceful node shutdown, ARP drop flows are installed
+// to prevent duplicate MAC responses when egress IP migrates to another node.
+var _ = ginkgo.Describe("[OVN network] Egress IP graceful shutdown with ARP drop flows", func() {
+	f := wrappedTestFramework("egress-ip-graceful-shutdown")
+	const (
+		egressIPName       = "egressip-graceful-shutdown"
+		pod1Name           = "e2e-egressip-pod1"
+		pod2Name           = "e2e-egressip-pod2"
+		bridgeName         = "br-ex"
+		arpDropFlowCookie  = "0xdeff105"
+		flowInstallTimeout = 30 * time.Second
+	)
+
+	const (
+		clusterNetworkHTTPPort uint16 = 8080
+		egressIPYaml           string = "/tmp/egressip-graceful-shutdown.yaml"
+		retryInterval                 = 1 * time.Second
+		retryTimeout                  = 90 * time.Second
+	)
+
+	var (
+		egress1Node, egress2Node, pod1Node, pod2Node node
+		primaryTargetExternalContainer               infraapi.ExternalContainer
+		providerCtx                                  infraapi.Context
+		isIPv6TestRun                                bool
+	)
+
+	verifyEgressIPStatusLengthEquals := func(statusLength int) []egressIPStatus {
+		var statuses []egressIPStatus
+		err := wait.PollImmediate(retryInterval, retryTimeout, func() (bool, error) {
+			statuses = getEgressIPStatusItems()
+			return len(statuses) == statusLength, nil
+		})
+		framework.ExpectNoError(err, "expected %d egress IP status items, got %d", statusLength, len(statuses))
+		return statuses
+	}
+
+	ginkgo.BeforeEach(func() {
+		nodes, err := e2enode.GetBoundedReadySchedulableNodes(context.TODO(), f.ClientSet, 3)
+		framework.ExpectNoError(err)
+		if len(nodes.Items) < 2 {
+			e2eskipper.Skipf("Test requires at least 2 schedulable nodes, got %d", len(nodes.Items))
+		}
+
+		ips := getNodeIPs(&nodes, networkAttachmentConfigParams{})
+		if len(ips) == 0 {
+			framework.Failf("expect at least one IP address")
+		}
+
+		isIPv6TestRun = utilnet.IsIPv6String(ips[0])
+		egress1Node = node{
+			name:   nodes.Items[1].Name,
+			nodeIP: ips[1],
+		}
+		egress2Node = node{
+			name:   nodes.Items[2].Name,
+			nodeIP: ips[2],
+		}
+		pod1Node = node{
+			name:   nodes.Items[0].Name,
+			nodeIP: ips[0],
+		}
+		pod2Node = node{
+			name:   nodes.Items[1].Name,
+			nodeIP: ips[1],
+		}
+
+		providerCtx, err = infraprovider.Get().Setup()
+		framework.ExpectNoError(err, "failed to setup infra provider")
+
+		primaryProviderNetwork, err := infraprovider.Get().PrimaryNetwork()
+		framework.ExpectNoError(err, "failed to get primary provider network")
+
+		primaryTargetExternalContainerPort := infraprovider.Get().GetExternalContainerPort()
+		primaryTargetExternalContainerSpec := infraapi.ExternalContainer{
+			Name:    "eip-shutdown-target",
+			Image:   images.AgnHost(),
+			Network: primaryProviderNetwork,
+			CmdArgs: getAgnHostHTTPPortBindCMDArgs(primaryTargetExternalContainerPort),
+			ExtPort: primaryTargetExternalContainerPort,
+		}
+		primaryTargetExternalContainer, err = providerCtx.CreateExternalContainer(primaryTargetExternalContainerSpec)
+		framework.ExpectNoError(err, "failed to create external target container")
+
+		ginkgo.By("Labeling nodes as available for egress IP")
+		labelNodeForEgress(f, egress1Node.name)
+		labelNodeForEgress(f, egress2Node.name)
+	})
+
+	ginkgo.AfterEach(func() {
+		if providerCtx != nil {
+			providerCtx.Cleanup()
+		}
+	})
+
+	ginkgo.It("Should install ARP drop flows before removing egress IP during graceful shutdown [Feature:EgressIP]", func() {
+		podNamespace := f.Namespace
+		labels := map[string]string{
+			"name": f.Namespace.Name,
+		}
+		updateNamespaceLabels(f, f.Namespace, labels)
+
+		ginkgo.By("Step 1: Creating EgressIP object with one egress IP")
+		var egressIP1 net.IP
+		var err error
+		if isIPv6TestRun {
+			egressIP1, err = ipalloc.NewPrimaryIPv6()
+		} else {
+			egressIP1, err = ipalloc.NewPrimaryIPv4()
+		}
+		gomega.Expect(err).ShouldNot(gomega.HaveOccurred(), "must allocate new egress IP")
+
+		podEgressLabel := map[string]string{
+			"wants": "egress",
+		}
+
+		egressIPYaml := "/tmp/" + egressIPName + ".yaml"
+		egressIPConfig := createEIPManifest(egressIPName, podEgressLabel, labels, egressIP1.String())
+
+		if err := os.WriteFile(egressIPYaml, []byte(egressIPConfig), 0644); err != nil {
+			framework.Failf("Unable to write EgressIP CRD config to disk: %v", err)
+		}
+		defer func() {
+			if err := os.Remove(egressIPYaml); err != nil {
+				framework.Logf("Unable to remove the EgressIP CRD config from disk: %v", err)
+			}
+		}()
+
+		framework.Logf("Creating the EgressIP configuration")
+		e2ekubectl.RunKubectlOrDie("default", "create", "-f", egressIPYaml)
+
+		ginkgo.By("Step 2: Verifying EgressIP status shows assignment to a node")
+		statuses := verifyEgressIPStatusLengthEquals(1)
+		assignedNode := statuses[0].Node
+		framework.Logf("Egress IP %s assigned to node: %s", egressIP1.String(), assignedNode)
+
+		// Update egress1Node to be the node that actually got the IP
+		if assignedNode != egress1Node.name {
+			egress1Node, egress2Node = egress2Node, egress1Node
+		}
+
+		ginkgo.By("Step 3: Verifying egress IP is configured on bridge interface")
+		gomega.Eventually(func() bool {
+			// Find ovnkube-node pod on the egress node
+			pods, err := f.ClientSet.CoreV1().Pods("ovn-kubernetes").List(context.TODO(), metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("spec.nodeName=%s", egress1Node.name),
+				LabelSelector: "app=ovnkube-node",
+			})
+			if err != nil || len(pods.Items) == 0 {
+				return false
+			}
+
+			podName := pods.Items[0].Name
+			cmd := fmt.Sprintf("ip addr show %s | grep -q '%s/'", bridgeName, egressIP1.String())
+			_, err = e2ekubectl.RunKubectl("ovn-kubernetes", "exec", podName, "-c", "ovnkube-node",
+				"--", "bash", "-c", cmd)
+			return err == nil
+		}, 30*time.Second, 2*time.Second).Should(gomega.BeTrue(),
+			fmt.Sprintf("Egress IP %s should be on bridge %s on node %s",
+				egressIP1.String(), bridgeName, egress1Node.name))
+
+		ginkgo.By("Step 4: Creating pod matching the EgressIP")
+		_, err = createGenericPodWithLabel(f, pod1Name, pod1Node.name, f.Namespace.Name,
+			getAgnHostHTTPPortBindFullCMD(clusterNetworkHTTPPort), podEgressLabel)
+		framework.ExpectNoError(err, "failed to create pod %s/%s", f.Namespace.Name, pod1Name)
+
+		err = wait.PollImmediate(retryInterval, retryTimeout, func() (bool, error) {
+			kubectlOut := getPodAddress(pod1Name, f.Namespace.Name)
+			srcIP := net.ParseIP(kubectlOut)
+			return srcIP != nil, nil
+		})
+		framework.ExpectNoError(err, "failed to get pod IP")
+		framework.Logf("Created pod %s on node %s", pod1Name, pod1Node.name)
+
+		ginkgo.By("Step 5: Verifying traffic from pod uses egress IP")
+		err = wait.PollImmediate(retryInterval, retryTimeout,
+			targetExternalContainerAndTest(primaryTargetExternalContainer, podNamespace.Name,
+				pod1Name, true, []string{egressIP1.String()}))
+		framework.ExpectNoError(err, "traffic from pod should use egress IP as source")
+
+		ginkgo.By("Step 6: Finding ovnkube-node pod on egress node")
+		ovnkubeNodePods, err := f.ClientSet.CoreV1().Pods("ovn-kubernetes").List(context.TODO(), metav1.ListOptions{
+			FieldSelector: fmt.Sprintf("spec.nodeName=%s", egress1Node.name),
+			LabelSelector: "app=ovnkube-node",
+		})
+		framework.ExpectNoError(err, "failed to list ovnkube-node pods")
+		gomega.Expect(len(ovnkubeNodePods.Items)).To(gomega.BeNumerically(">", 0),
+			"should have ovnkube-node pod on egress node")
+		ovnkubeNodePod := ovnkubeNodePods.Items[0].Name
+
+		ginkgo.By("Step 7: Initiating graceful shutdown of ovnkube-node on egress node")
+		framework.Logf("Deleting ovnkube-node pod %s to simulate graceful shutdown", ovnkubeNodePod)
+		gracePeriod := int64(30)
+		err = f.ClientSet.CoreV1().Pods("ovn-kubernetes").Delete(context.TODO(), ovnkubeNodePod, metav1.DeleteOptions{
+			GracePeriodSeconds: &gracePeriod,
+		})
+		framework.ExpectNoError(err, "failed to delete ovnkube-node pod")
+
+		ginkgo.By("Step 8: Verifying ARP drop flows are installed during shutdown")
+		flowsInstalled := false
+		err = wait.PollImmediate(500*time.Millisecond, flowInstallTimeout, func() (bool, error) {
+			// Find the ovnkube-node pod (terminating or new one)
+			pods, err := f.ClientSet.CoreV1().Pods("ovn-kubernetes").List(context.TODO(), metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("spec.nodeName=%s", egress1Node.name),
+				LabelSelector: "app=ovnkube-node",
+			})
+			if err != nil || len(pods.Items) == 0 {
+				return false, nil
+			}
+
+			podName := pods.Items[0].Name
+			cmd := fmt.Sprintf("ovs-ofctl dump-flows %s cookie=%s/-1 2>/dev/null || true",
+				bridgeName, arpDropFlowCookie)
+			output, err := e2ekubectl.RunKubectl("ovn-kubernetes", "exec", podName, "-c", "ovnkube-node",
+				"--", "bash", "-c", cmd)
+			if err != nil {
+				framework.Logf("Error getting OVS flows: %v", err)
+				return false, nil
+			}
+
+			// Check for drop flow matching our egress IP
+			lines := strings.Split(output, "\n")
+			for _, line := range lines {
+				matchesIPv4 := strings.Contains(line, fmt.Sprintf("arp_tpa=%s", egressIP1.String())) &&
+					strings.Contains(line, "actions=drop")
+				matchesIPv6 := strings.Contains(line, fmt.Sprintf("nd_target=%s", egressIP1.String())) &&
+					strings.Contains(line, "icmp_type=135") &&
+					strings.Contains(line, "actions=drop")
+
+				if matchesIPv4 || matchesIPv6 {
+					framework.Logf("✓ Found ARP/NDP drop flow: %s", line)
+					flowsInstalled = true
+					return true, nil
+				}
+			}
+			return false, nil
+		})
+
+		gomega.Expect(flowsInstalled).To(gomega.BeTrue(),
+			"ARP drop flows should be installed during graceful shutdown")
+
+		ginkgo.By("Step 9: Verifying egress IP is removed from bridge interface after drop flows")
+		gomega.Eventually(func() bool {
+			// Try to get the ovnkube-node pod (might be terminating or new one starting)
+			pods, err := f.ClientSet.CoreV1().Pods("ovn-kubernetes").List(context.TODO(), metav1.ListOptions{
+				FieldSelector: fmt.Sprintf("spec.nodeName=%s", egress1Node.name),
+				LabelSelector: "app=ovnkube-node",
+			})
+			if err != nil || len(pods.Items) == 0 {
+				return true // Pod gone, assume IP removed
+			}
+
+			podName := pods.Items[0].Name
+			cmd := fmt.Sprintf("ip addr show %s | grep -q '%s/' || echo 'not found'",
+				bridgeName, egressIP1.String())
+			output, err := e2ekubectl.RunKubectl("ovn-kubernetes", "exec", podName, "-c", "ovnkube-node",
+				"--", "bash", "-c", cmd)
+			return err != nil || strings.Contains(output, "not found")
+		}, 30*time.Second, 1*time.Second).Should(gomega.BeTrue(),
+			"Egress IP should be removed from bridge after drop flows are installed")
+
+		ginkgo.By("Step 10: Waiting for egress IP migration to backup node")
+		gomega.Eventually(func() bool {
+			statuses := verifyEgressIPStatusLengthEquals(1)
+			if len(statuses) > 0 && statuses[0].Node == egress2Node.name {
+				framework.Logf("Egress IP migrated to backup node: %s", egress2Node.name)
+				return true
+			}
+			return false
+		}, 2*time.Minute, 2*time.Second).Should(gomega.BeTrue(),
+			fmt.Sprintf("EgressIP should be migrated to backup node %s", egress2Node.name))
+
+		ginkgo.By("Step 11: Creating new pod to verify traffic continues with egress IP")
+		_, err = createGenericPodWithLabel(f, pod2Name, pod2Node.name, f.Namespace.Name,
+			getAgnHostHTTPPortBindFullCMD(clusterNetworkHTTPPort), podEgressLabel)
+		framework.ExpectNoError(err, "failed to create pod %s/%s", f.Namespace.Name, pod2Name)
+
+		err = wait.PollImmediate(retryInterval, retryTimeout, func() (bool, error) {
+			kubectlOut := getPodAddress(pod2Name, f.Namespace.Name)
+			srcIP := net.ParseIP(kubectlOut)
+			return srcIP != nil, nil
+		})
+		framework.ExpectNoError(err, "failed to get pod2 IP")
+
+		ginkgo.By("Step 12: Verifying traffic from new pod uses egress IP from backup node")
+		err = wait.PollImmediate(retryInterval, retryTimeout,
+			targetExternalContainerAndTest(primaryTargetExternalContainer, podNamespace.Name,
+				pod2Name, true, []string{egressIP1.String()}))
+		framework.ExpectNoError(err,
+			"traffic should continue using egress IP from backup node after migration")
+
+		framework.Logf("✓ Test passed: ARP drop flows prevented duplicate MAC during graceful shutdown")
+	})
+})

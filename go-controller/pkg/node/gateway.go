@@ -35,10 +35,13 @@ type Gateway interface {
 	Start() error
 	GetGatewayBridgeIface() string
 	GetGatewayIface() string
+	GetOfPortPhys() string
 	SetDefaultGatewayBridgeMAC(addr net.HardwareAddr)
 	SetDefaultPodNetworkAdvertised(bool)
 	SetDefaultBridgeGARPDropFlows(bool)
+	SetDropEgressIPARP(bool, []net.IP)
 	Reconcile() error
+	CleanupEgressIPs([]net.IP) error
 }
 
 type gateway struct {
@@ -308,6 +311,38 @@ func (g *gateway) SyncEgressIP(eips []interface{}) error {
 	return nil
 }
 
+// CleanupEgressIPs removes Egress IPs from the bridge interface during shutdown.
+// This is optimized for fast shutdown: it only removes IPs from the interface without
+// updating annotations or doing full reconciliation, since we're shutting down anyway.
+// The caller has already filtered and extracted IP addresses assigned to this node.
+func (g *gateway) CleanupEgressIPs(ips []net.IP) error {
+	if !canHandleBridgeEgressIP() || g.bridgeEIPAddrManager == nil {
+		return nil
+	}
+
+	if len(ips) == 0 {
+		return nil
+	}
+
+	klog.Infof("Fast shutdown: removing %d Egress IPs from bridge interface", len(ips))
+
+	// Remove all IPs from bridge interface directly (no annotation updates, no reconciliation)
+	var errs []error
+	for _, ip := range ips {
+		if err := g.bridgeEIPAddrManager.DeleteIPFromBridge(ip); err != nil {
+			klog.Errorf("Failed to remove Egress IP %s from bridge during shutdown: %v", ip.String(), err)
+			errs = append(errs, err)
+		}
+	}
+
+	if len(errs) > 0 {
+		return utilerrors.Join(errs...)
+	}
+
+	klog.Infof("Successfully removed %d Egress IPs from bridge interface", len(ips))
+	return nil
+}
+
 func (g *gateway) Init(stopChan <-chan struct{}, wg *sync.WaitGroup) error {
 	g.stopChan = stopChan
 	g.wg = wg
@@ -491,6 +526,13 @@ func (g *gateway) GetGatewayIface() string {
 	}
 }
 
+func (g *gateway) GetOfPortPhys() string {
+	if g.openflowManager == nil {
+		return ""
+	}
+	return g.openflowManager.defaultBridge.GetOfPortPhys()
+}
+
 // SetDefaultGatewayBridgeMAC updates the mac address for the OFM used to render flows with
 func (g *gateway) SetDefaultGatewayBridgeMAC(macAddr net.HardwareAddr) {
 	if config.OvnKubeNode.Mode == types.NodeModeDPUHost {
@@ -525,6 +567,19 @@ func (g *gateway) SetDefaultBridgeGARPDropFlows(isDropped bool) {
 		return
 	}
 	g.openflowManager.setDefaultBridgeGARPDrop(isDropped)
+}
+
+// SetDropEgressIPARP configures whether to drop ARP/NDP requests for egress IPs from physical interface.
+// This should only be called during graceful shutdown to prevent duplicate MAC responses.
+func (g *gateway) SetDropEgressIPARP(drop bool, egressIPs []net.IP) {
+	if config.OvnKubeNode.Mode == types.NodeModeDPUHost {
+		return
+	}
+
+	if g.openflowManager == nil {
+		return
+	}
+	g.openflowManager.setDropEgressIPARP(drop, egressIPs)
 }
 
 // Reconcile handles triggering updates to different components of a gateway, like OFM, Services

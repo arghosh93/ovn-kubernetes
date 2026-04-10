@@ -84,6 +84,12 @@ func (c *openflowManager) setDefaultBridgeGARPDrop(isDropped bool) {
 	c.defaultBridge.SetDropGARP(isDropped)
 }
 
+// setDropEgressIPARP is used to enable or disable whether openflow manager generates ovs flows and adds them to
+// the default ext bridge to drop ARP/NDP requests for egress IPs from physical interface during graceful shutdown
+func (c *openflowManager) setDropEgressIPARP(drop bool, egressIPs []net.IP) {
+	c.defaultBridge.SetDropEgressIPARP(drop, egressIPs)
+}
+
 func (c *openflowManager) updateFlowCacheEntry(key string, flows []string) {
 	c.flowMutex.Lock()
 	defer c.flowMutex.Unlock()

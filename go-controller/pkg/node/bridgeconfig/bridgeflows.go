@@ -68,11 +68,18 @@ func (b *BridgeConfiguration) flowsForDefaultBridge(extraIPs []net.IP) ([]string
 	// has sync'd and changes propagated to OVN SB DB.
 	// remove when ovn contains native support for logical router ports to contain an option to silence GARPs on startup of ovn-controller.
 	// https://issues.redhat.com/browse/FDP-1537
-	if b.dropGARP {
+	if b.dropFlowCfg.dropGARP {
 		// priority 499 flows to allow GARP pkts when src IP is a Node IP
 		dftFlows = append(dftFlows, b.allowNodeIPGARPFlows(extraIPs)...)
 		// priority 498 flows to drop GARP pkts with no regards to src IP
 		dftFlows = append(dftFlows, b.dropGARPFlows()...)
+	}
+
+	// During graceful shutdown, drop ARP requests for egress IPs from physical interface
+	// to prevent OVN logical flows from responding after cluster controller has migrated the IP
+	if b.dropFlowCfg.dropEgressIPARP && len(b.dropFlowCfg.egressIPs) > 0 {
+		// priority 1000 flows to drop ARP requests for egress IPs from physical interface
+		dftFlows = append(dftFlows, b.dropEgressIPARPFlows()...)
 	}
 
 	if config.IPv4Mode {
@@ -1014,6 +1021,41 @@ func (b *BridgeConfiguration) allowNodeIPGARPFlows(nodeIPs []net.IP) []string {
 		}
 
 	}
+	return flows
+}
+
+// dropEgressIPARPFlows generates OVS flows to drop ARP/NDP requests for egress IPs from the physical interface.
+// This prevents OVN logical flows in br-int (tables 11, 38) from responding to ARP/NDP requests during graceful
+// shutdown, which would cause duplicate MAC responses when the cluster controller migrates the egress IP.
+// bridgeConfiguration lock must be held by caller.
+func (b *BridgeConfiguration) dropEgressIPARPFlows() []string {
+	if b.ofPortPhys == "" {
+		klog.V(5).Info("Physical port not configured, skipping egress IP ARP/NDP drop flows")
+		return nil
+	}
+
+	const priority = 1000
+	var flows []string
+
+	// Add drop flow for each egress IP
+	// Priority 1000 ensures these flows take precedence over other flows
+	// Cookie 0xdeff105 matches other default OVN flows
+	for _, ip := range b.dropFlowCfg.egressIPs {
+		if ip.To4() != nil {
+			// IPv4: Drop ARP requests for this egress IP coming from physical interface
+			// This prevents OVN from responding to ARP while still allowing internal traffic
+			flow := fmt.Sprintf("cookie=0xdeff105,table=0,priority=%d,arp,in_port=%s,arp_tpa=%s,arp_op=1,actions=drop",
+				priority, b.ofPortPhys, ip.String())
+			flows = append(flows, flow)
+		} else {
+			// IPv6: Drop Neighbor Solicitation (NDP equivalent of ARP request) for this egress IP
+			// ICMPv6 type 135 = Neighbor Solicitation
+			flow := fmt.Sprintf("cookie=0xdeff105,table=0,priority=%d,icmp6,in_port=%s,icmp_type=135,nd_target=%s,actions=drop",
+				priority, b.ofPortPhys, ip.String())
+			flows = append(flows, flow)
+		}
+	}
+
 	return flows
 }
 

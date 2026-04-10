@@ -3,6 +3,7 @@ package controllermanager
 import (
 	"context"
 	"fmt"
+	"net"
 	"strings"
 	"sync"
 	"sync/atomic"
@@ -10,6 +11,7 @@ import (
 
 	v1 "github.com/k8snetworkplumbingwg/network-attachment-definition-client/pkg/apis/k8s.cni.cncf.io/v1"
 
+	"k8s.io/apimachinery/pkg/labels"
 	kerrors "k8s.io/apimachinery/pkg/util/errors"
 	"k8s.io/apimachinery/pkg/util/sets"
 	"k8s.io/apimachinery/pkg/util/wait"
@@ -454,9 +456,31 @@ func (ncm *NodeControllerManager) Stop(isOVNKubeControllerSyncd *atomic.Bool) {
 
 	if ncm.defaultNodeNetworkController != nil {
 		if isOVNKubeControllerSyncd != nil && ncm.defaultNodeNetworkController.Gateway != nil {
+			// Get all Egress IPs assigned to this node for drop flow configuration
+			assignedIPs, err := ncm.getAssignedEgressIPs()
+			if err != nil {
+				klog.Errorf("Failed to get assigned Egress IPs during shutdown: %v", err)
+			}
+
+			// Step 1: Configure egress IP ARP/NDP drop flows
+			// This prevents OVN logical flows in br-int from responding to ARP/NDP requests for egress IPs
+			// Must be configured BEFORE Reconcile() so flows are installed during bridge reconciliation
+			if len(assignedIPs) > 0 {
+				ncm.defaultNodeNetworkController.Gateway.SetDropEgressIPARP(true, assignedIPs)
+			}
+
+			// Step 2: Add GARP drop flows and reconcile gateway
+			// Reconcile will install both GARP drop flows and egress IP ARP drop flows
 			ncm.defaultNodeNetworkController.Gateway.SetDefaultBridgeGARPDropFlows(true)
 			if err := ncm.defaultNodeNetworkController.Gateway.Reconcile(); err != nil {
-				klog.Errorf("Failed to reconcile gateway after attempting to add flows to the external bridge to drop GARPs: %v", err)
+				klog.Errorf("Failed to reconcile gateway after adding drop flows: %v", err)
+			}
+
+			// Step 3: Remove Egress IPs from bridge interface
+			if len(assignedIPs) > 0 {
+				if err := ncm.defaultNodeNetworkController.Gateway.CleanupEgressIPs(assignedIPs); err != nil {
+					klog.Errorf("Failed to cleanup Egress IPs during shutdown: %v", err)
+				}
 			}
 		}
 		ncm.defaultNodeNetworkController.Stop()
@@ -466,6 +490,38 @@ func (ncm *NodeControllerManager) Stop(isOVNKubeControllerSyncd *atomic.Bool) {
 	if ncm.networkManager != nil {
 		ncm.networkManager.Stop()
 	}
+}
+
+// getAssignedEgressIPs returns IP addresses of all Egress IPs assigned to this node
+func (ncm *NodeControllerManager) getAssignedEgressIPs() ([]net.IP, error) {
+	// Use informer lister for cached access (doesn't hit API server)
+	egressIPLister := ncm.watchFactory.EgressIPInformer().Lister()
+
+	// List all EgressIP resources from cache
+	egressIPs, err := egressIPLister.List(labels.Everything())
+	if err != nil {
+		return nil, fmt.Errorf("failed to list EgressIPs from cache: %w", err)
+	}
+
+	// Filter for EgressIPs assigned to this node and extract IP addresses
+	var assignedIPs []net.IP
+	for _, eip := range egressIPs {
+		for _, status := range eip.Status.Items {
+			if status.Node == ncm.name {
+				ip := net.ParseIP(status.EgressIP)
+				if ip != nil {
+					assignedIPs = append(assignedIPs, ip)
+					klog.V(5).Infof("Found Egress IP %s (IP: %s) assigned to this node", eip.Name, status.EgressIP)
+				} else {
+					klog.Warningf("Invalid Egress IP format in status: %s", status.EgressIP)
+				}
+				break // Move to next EgressIP resource
+			}
+		}
+	}
+
+	klog.V(5).Infof("Found %d Egress IPs assigned to node %s", len(assignedIPs), ncm.name)
+	return assignedIPs, nil
 }
 
 // checkForStaleOVSRepresentorInterfaces checks for stale OVS ports backed by Repreresentor interfaces,
