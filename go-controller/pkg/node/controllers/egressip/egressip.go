@@ -846,30 +846,87 @@ func (c *Controller) applyPodConfig(existingPodIPsConfig *podIPConfigList, updat
 	if updatedPodIPsConfig == nil {
 		return fmt.Errorf("unexpected nil updated config")
 	}
-	newPodIPConfigs := newPodIPConfigList()
+	// Each podIPConfig is either v4 or v6 (pIC.v6), giving us three independent
+	// batches to apply: netlink IP rules, IPv4 iptables SNAT rules, IPv6 iptables SNAT rules.
+	var ipRulesToApply []netlink.Rule
+	var ipv4RulesToApply []iptables.RuleArg
+	var ipv6RulesToApply []iptables.RuleArg
+	var configsNeedingIPRule []*podIPConfig
+	var configsNeedingIPv4Table []*podIPConfig
+	var configsNeedingIPv6Table []*podIPConfig
+
 	for _, newConfig := range updatedPodIPsConfig.elems {
-		if !existingPodIPsConfig.hasWithoutError(newConfig) {
-			newPodIPConfigs.insert(*newConfig)
+		existing := existingPodIPsConfig.findEqual(newConfig)
+		needsIPRule := existing == nil || existing.ipRuleFailed
+		needsIPTable := existing == nil || existing.ipTableRuleFailed
+
+		if needsIPRule {
+			ipRulesToApply = append(ipRulesToApply, newConfig.ipRule)
+			configsNeedingIPRule = append(configsNeedingIPRule, newConfig)
 		}
-	}
-	for _, newPodIPConfig := range newPodIPConfigs.elems {
-		if err := c.ruleManager.Add(newPodIPConfig.ipRule); err != nil {
-			existingPodIPsConfig.insertOverwriteFailed(*newPodIPConfig)
-			return err
-		}
-		if newPodIPConfig.v6 {
-			if err := c.iptablesManager.EnsureRule(utiliptables.TableNAT, iptChainName, utiliptables.ProtocolIPv6, newPodIPConfig.ipTableRule); err != nil {
-				existingPodIPsConfig.insertOverwriteFailed(*newPodIPConfig)
-				return fmt.Errorf("unable to ensure iptables rules: %v", err)
-			}
-		} else {
-			if err := c.iptablesManager.EnsureRule(utiliptables.TableNAT, iptChainName, utiliptables.ProtocolIPv4, newPodIPConfig.ipTableRule); err != nil {
-				existingPodIPsConfig.insertOverwriteFailed(*newPodIPConfig)
-				return fmt.Errorf("failed to ensure rules (%+v) in chain %s: %v", newPodIPConfig.ipTableRule, iptChainName, err)
+		if needsIPTable {
+			if newConfig.v6 {
+				ipv6RulesToApply = append(ipv6RulesToApply, newConfig.ipTableRule)
+				configsNeedingIPv6Table = append(configsNeedingIPv6Table, newConfig)
+			} else {
+				ipv4RulesToApply = append(ipv4RulesToApply, newConfig.ipTableRule)
+				configsNeedingIPv4Table = append(configsNeedingIPv4Table, newConfig)
 			}
 		}
-		existingPodIPsConfig.insertOverwrite(*newPodIPConfig)
 	}
+
+	if len(ipRulesToApply) == 0 && len(ipv4RulesToApply) == 0 && len(ipv6RulesToApply) == 0 {
+		return nil
+	}
+
+	// Batch 1: netlink IP rules
+	if len(ipRulesToApply) > 0 {
+		if err := c.ruleManager.AddRules(ipRulesToApply); err != nil {
+			for _, cfg := range configsNeedingIPRule {
+				existingPodIPsConfig.insertOverwriteIPRuleFailed(*cfg)
+			}
+			return fmt.Errorf("failed to add IP rules in batch: %v", err)
+		}
+		for _, cfg := range configsNeedingIPRule {
+			existingPodIPsConfig.insertOverwriteIPRuleApplied(*cfg)
+			// For fresh configs where iptables is still pending, mark ipTableRuleFailed=true
+			// so an early-return from a later batch failure doesn't strand them in (false,false) state.
+			if cfg.v6 {
+				existingPodIPsConfig.markIPTablePending(cfg, configsNeedingIPv6Table)
+			} else {
+				existingPodIPsConfig.markIPTablePending(cfg, configsNeedingIPv4Table)
+			}
+		}
+	}
+
+	// Batch 2: IPv4 iptables SNAT rules
+	if len(ipv4RulesToApply) > 0 {
+		if err := c.iptablesManager.EnsureRules(utiliptables.TableNAT, iptChainName,
+			utiliptables.ProtocolIPv4, ipv4RulesToApply); err != nil {
+			for _, cfg := range configsNeedingIPv4Table {
+				existingPodIPsConfig.insertOverwriteIPTableRuleFailed(*cfg)
+			}
+			return fmt.Errorf("failed to ensure IPv4 iptables rules in batch: %v", err)
+		}
+		for _, cfg := range configsNeedingIPv4Table {
+			existingPodIPsConfig.insertOverwriteIPTableRuleApplied(*cfg)
+		}
+	}
+
+	// Batch 3: IPv6 iptables SNAT rules
+	if len(ipv6RulesToApply) > 0 {
+		if err := c.iptablesManager.EnsureRules(utiliptables.TableNAT, iptChainName,
+			utiliptables.ProtocolIPv6, ipv6RulesToApply); err != nil {
+			for _, cfg := range configsNeedingIPv6Table {
+				existingPodIPsConfig.insertOverwriteIPTableRuleFailed(*cfg)
+			}
+			return fmt.Errorf("failed to ensure IPv6 iptables rules in batch: %v", err)
+		}
+		for _, cfg := range configsNeedingIPv6Table {
+			existingPodIPsConfig.insertOverwriteIPTableRuleApplied(*cfg)
+		}
+	}
+
 	return nil
 }
 

@@ -18,6 +18,9 @@ func (f *FakeControllerWithError) Run(_ <-chan struct{}, _ time.Duration) {
 func (f *FakeControllerWithError) Add(_ netlink.Rule) error {
 	return nil
 }
+func (f *FakeControllerWithError) AddRules(_ []netlink.Rule) error {
+	return nil
+}
 func (f *FakeControllerWithError) AddWithMetadata(_ netlink.Rule, _ string) error {
 	return nil
 }

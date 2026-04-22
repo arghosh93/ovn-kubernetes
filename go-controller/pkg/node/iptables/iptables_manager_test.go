@@ -262,6 +262,149 @@ var _ = ginkgo.Describe("IPTables Manager", func() {
 			}).WithTimeout(oneSecTimeout).Should(gomega.BeFalse())
 		})
 	})
+
+	ginkgo.Context("Batch Ensure IPv4 Rules", func() {
+		testRuleArgs := []RuleArg{
+			{
+				[]string{"-s", "192.168.1.10/32", "-o", "eth0", "-j", "SNAT", "--to-source", "1.1.1.10"},
+			},
+			{
+				[]string{"-s", "192.168.1.11/32", "-o", "eth0", "-j", "SNAT", "--to-source", "1.1.1.11"},
+			},
+			{
+				[]string{"-s", "192.168.1.12/32", "-o", "eth0", "-j", "SNAT", "--to-source", "1.1.1.12"},
+			},
+		}
+
+		ginkgo.It("ensure multiple rules exist in batch", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv4, testRuleArgs)
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV4, utiliptables.TableNAT, testChainName, testRuleArgs)
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+		})
+
+		ginkgo.It("batch ensure with empty slice should succeed", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv4, []RuleArg{})
+			})).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("batch ensure should deduplicate existing rules", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv4, testRuleArgs[:2])
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV4, utiliptables.TableNAT, testChainName, testRuleArgs[:2])
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv4, testRuleArgs)
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV4, utiliptables.TableNAT, testChainName, testRuleArgs)
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+
+			gomega.Eventually(func() int {
+				var count int
+				err := testNS.Do(func(ns.NetNS) error {
+					existingRuleArgs, err := getChainRuleArgs(c.iptV4, utiliptables.TableNAT, testChainName)
+					if err != nil {
+						return err
+					}
+					count = len(existingRuleArgs)
+					return nil
+				})
+				if err != nil {
+					return -1
+				}
+				return count
+			}).WithTimeout(oneSecTimeout).Should(gomega.Equal(3))
+		})
+
+		ginkgo.It("batch ensure recovers following manual removal", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv4, testRuleArgs)
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV4, utiliptables.TableNAT, testChainName, testRuleArgs)
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+
+			gomega.Eventually(testNS.Do).WithArguments(func(ns.NetNS) error {
+				return c.iptV4.DeleteRule(utiliptables.TableNAT, testChainName, testRuleArgs[0].Args...)
+			}).WithTimeout(oneSecTimeout).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV4, utiliptables.TableNAT, testChainName, testRuleArgs)
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+		})
+	})
+
+	ginkgo.Context("Batch Ensure IPv6 Rules", func() {
+		testRuleArgs := []RuleArg{
+			{
+				[]string{"-s", "2001:0:0:3::1/128", "-o", "eth0", "-j", "SNAT", "--to-source", "2001::10"},
+			},
+			{
+				[]string{"-s", "2001:0:0:3::2/128", "-o", "eth0", "-j", "SNAT", "--to-source", "2001::11"},
+			},
+			{
+				[]string{"-s", "2001:0:0:3::3/128", "-o", "eth0", "-j", "SNAT", "--to-source", "2001::12"},
+			},
+		}
+
+		ginkgo.It("ensure multiple IPv6 rules exist in batch", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv6, testRuleArgs)
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV6, utiliptables.TableNAT, testChainName, testRuleArgs)
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+		})
+
+		ginkgo.It("batch ensure IPv6 with empty slice should succeed", func() {
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv6, []RuleArg{})
+			})).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("batch ensure IPv6 should deduplicate existing rules", func() {
+			// First, add some rules
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv6, testRuleArgs[:2])
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() bool {
+				return containsRuleArgs(testNS, c.iptV6, utiliptables.TableNAT, testChainName, testRuleArgs[:2])
+			}).WithTimeout(oneSecTimeout).Should(gomega.BeTrue())
+
+			gomega.Expect(testNS.Do(func(ns.NetNS) error {
+				return c.EnsureRules(utiliptables.TableNAT, testChainName, utiliptables.ProtocolIPv6, testRuleArgs)
+			})).Should(gomega.Succeed())
+
+			gomega.Eventually(func() int {
+				var count int
+				err := testNS.Do(func(ns.NetNS) error {
+					existingRuleArgs, err := getChainRuleArgs(c.iptV6, utiliptables.TableNAT, testChainName)
+					if err != nil {
+						return err
+					}
+					count = len(existingRuleArgs)
+					return nil
+				})
+				if err != nil {
+					return -1
+				}
+				return count
+			}).WithTimeout(oneSecTimeout).Should(gomega.Equal(3))
+		})
+	})
 })
 
 func commandExists(cmd string) bool {

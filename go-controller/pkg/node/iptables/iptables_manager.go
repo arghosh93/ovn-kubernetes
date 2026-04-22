@@ -193,6 +193,47 @@ func (c *Controller) EnsureRule(table iptables.Table, chain iptables.Chain, prot
 	return c.reconcile()
 }
 
+// EnsureRules adds multiple iptable rules in batch and reconciles only once.
+func (c *Controller) EnsureRules(table iptables.Table, chain iptables.Chain, proto iptables.Protocol, ruleArgs []RuleArg) error {
+	if len(ruleArgs) == 0 {
+		return nil
+	}
+	klog.Infof("IPTables manager: ensure %d rules (batch) - table %s, chain %s, protocol %s", len(ruleArgs), table, chain, proto)
+	c.mu.Lock()
+	defer c.mu.Unlock()
+
+	ruleIndex := rulesIndex{
+		Table: table,
+		Chain: chain,
+		Proto: proto,
+	}
+
+	existingRuleArgs, exists := c.store[ruleIndex]
+	if !exists {
+		rules := newRules()
+		rules.ruleArgs = make([]RuleArg, 0, len(ruleArgs))
+		rules.ruleArgs = append(rules.ruleArgs, ruleArgs...)
+		c.store[ruleIndex] = rules
+	} else {
+		// Add only the rules that don't already exist
+		for _, ruleArg := range ruleArgs {
+			found := false
+			for _, existingRuleArg := range existingRuleArgs.ruleArgs {
+				if existingRuleArg.equal(ruleArg) {
+					found = true
+					break
+				}
+			}
+			if !found {
+				existingRuleArgs.ruleArgs = append(existingRuleArgs.ruleArgs, ruleArg)
+			}
+		}
+		c.store[ruleIndex] = existingRuleArgs
+	}
+
+	return c.reconcile()
+}
+
 func (c *Controller) GetChainRuleArgs(table iptables.Table, chain iptables.Chain, proto iptables.Protocol) ([]RuleArg, error) {
 	if proto == iptables.ProtocolIPv4 {
 		return c.GetIPv4ChainRuleArgs(table, chain)

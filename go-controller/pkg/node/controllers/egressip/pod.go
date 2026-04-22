@@ -25,10 +25,11 @@ import (
 // podIPConfig holds pod specific info to implement egress IP for secondary host networks for a single pod IP. A pod may
 // contain multiple IPs (one for single stack, 2 for dual stack).
 type podIPConfig struct {
-	failed      bool // used for retry
-	v6          bool
-	ipTableRule iptables.RuleArg
-	ipRule      netlink.Rule
+	ipRuleFailed      bool // used for retry: true if the netlink IP rule failed to apply
+	ipTableRuleFailed bool // used for retry: true if the iptables SNAT rule failed to apply
+	v6                bool
+	ipTableRule       iptables.RuleArg
+	ipRule            netlink.Rule
 }
 
 func newPodIPConfig() *podIPConfig {
@@ -62,13 +63,14 @@ func (pICL *podIPConfigList) len() int {
 	return len(pICL.elems)
 }
 
-func (pICL *podIPConfigList) hasWithoutError(pIC2 *podIPConfig) bool {
+// findEqual returns the existing podIPConfig that is logically equal to pIC2, or nil if not found.
+func (pICL *podIPConfigList) findEqual(pIC2 *podIPConfig) *podIPConfig {
 	for _, pIC := range pICL.elems {
-		if pIC.equal(pIC2) && !pIC.failed {
-			return true
+		if pIC.equal(pIC2) {
+			return pIC
 		}
 	}
-	return false
+	return nil
 }
 
 func (pICL *podIPConfigList) has(pIC2 *podIPConfig) bool {
@@ -96,10 +98,87 @@ func (pICL *podIPConfigList) remove(idxs ...int) {
 }
 
 // insertOverwriteFailed should be used to add elements to the podIPConfigList that have failed to be applied.
+// It marks both ipRuleFailed and ipTableRuleFailed so the config is fully retried next cycle.
 func (pICL *podIPConfigList) insertOverwriteFailed(pICs ...podIPConfig) {
 	for _, pIC := range pICs {
-		pIC.failed = true
+		pIC.ipRuleFailed = true
+		pIC.ipTableRuleFailed = true
 		pICL.insertOverwrite(pIC)
+	}
+}
+
+// insertOverwriteIPRuleFailed marks the config as having failed at the netlink IP-rule step.
+// For existing configs, it preserves the iptables state. For fresh configs, it marks both
+// dimensions as failed since the IP rule failure means iptables was never attempted.
+func (pICL *podIPConfigList) insertOverwriteIPRuleFailed(pICs ...podIPConfig) {
+	for _, pIC := range pICs {
+		if ex := pICL.findEqual(&pIC); ex != nil {
+			ex.ipRuleFailed = true
+		} else {
+			pIC.ipRuleFailed = true
+			pIC.ipTableRuleFailed = true
+			pICL.insertOverwrite(pIC)
+		}
+	}
+}
+
+// insertOverwriteIPTableRuleFailed marks the config as having failed at the iptables-rule step.
+// For existing configs, it preserves the IP rule state. For fresh configs, it marks both
+// dimensions as failed since this should only be called for configs where IP rules succeeded.
+func (pICL *podIPConfigList) insertOverwriteIPTableRuleFailed(pICs ...podIPConfig) {
+	for _, pIC := range pICs {
+		if ex := pICL.findEqual(&pIC); ex != nil {
+			ex.ipTableRuleFailed = true
+		} else {
+			pIC.ipRuleFailed = true
+			pIC.ipTableRuleFailed = true
+			pICL.insertOverwrite(pIC)
+		}
+	}
+}
+
+// insertOverwriteIPRuleApplied marks the config as having successfully applied the IP rule.
+// For existing configs, it clears ipRuleFailed. For fresh configs, it inserts the config
+// with both dimensions marked as applied.
+func (pICL *podIPConfigList) insertOverwriteIPRuleApplied(pICs ...podIPConfig) {
+	for _, pIC := range pICs {
+		if ex := pICL.findEqual(&pIC); ex != nil {
+			ex.ipRuleFailed = false
+		} else {
+			pIC.ipRuleFailed = false
+			pIC.ipTableRuleFailed = false
+			pICL.insertOverwrite(pIC)
+		}
+	}
+}
+
+// insertOverwriteIPTableRuleApplied marks the config as having successfully applied the iptables rule.
+// For existing configs, it clears ipTableRuleFailed. For fresh configs, it inserts the config
+// with both dimensions marked as applied.
+func (pICL *podIPConfigList) insertOverwriteIPTableRuleApplied(pICs ...podIPConfig) {
+	for _, pIC := range pICs {
+		if ex := pICL.findEqual(&pIC); ex != nil {
+			ex.ipTableRuleFailed = false
+		} else {
+			pIC.ipRuleFailed = false
+			pIC.ipTableRuleFailed = false
+			pICL.insertOverwrite(pIC)
+		}
+	}
+}
+
+// markIPTablePending marks a config as having pending iptables rules if it's found in the
+// configsNeedingIPTable list.
+func (pICL *podIPConfigList) markIPTablePending(cfg *podIPConfig, configsNeedingIPTable []*podIPConfig) {
+	// Check if this config needs iptables rules applied
+	for _, iptCfg := range configsNeedingIPTable {
+		if cfg.equal(iptCfg) {
+			// Found - mark iptables as pending
+			if ex := pICL.findEqual(cfg); ex != nil {
+				ex.ipTableRuleFailed = true
+			}
+			return
+		}
 	}
 }
 

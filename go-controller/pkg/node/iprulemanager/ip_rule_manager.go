@@ -19,6 +19,7 @@ import (
 type Interface interface {
 	Run(stopCh <-chan struct{}, syncPeriod time.Duration)
 	Add(rule netlink.Rule) error
+	AddRules(rules []netlink.Rule) error
 	AddWithMetadata(rule netlink.Rule, metadata string) error
 	Delete(rule netlink.Rule) error
 	DeleteWithMetadata(metadata string) error
@@ -96,6 +97,35 @@ func (rm *Controller) AddWithMetadata(rule netlink.Rule, metadata string) error 
 		}
 	}
 	rm.rules = append(rm.rules, ipRule{rule: &rule, metadata: metadata})
+	return rm.reconcile()
+}
+
+// AddRules ensures multiple IP rules are applied in batch with a single reconcile.
+func (rm *Controller) AddRules(rules []netlink.Rule) error {
+	if len(rules) == 0 {
+		return nil
+	}
+	klog.V(5).Infof("IP Rule manager: adding %d rules in batch", len(rules))
+
+	rm.mu.Lock()
+	defer rm.mu.Unlock()
+
+	// Check which rules are not already managed and add them
+	for _, rule := range rules {
+		found := false
+		for _, existingRule := range rm.rules {
+			if areNetlinkRulesEqual(existingRule.rule, &rule) {
+				found = true
+				break
+			}
+		}
+		if !found {
+			// Make a copy of the rule to avoid pointer issues
+			ruleCopy := rule
+			rm.rules = append(rm.rules, ipRule{rule: &ruleCopy}) // empty metadata
+		}
+	}
+
 	return rm.reconcile()
 }
 

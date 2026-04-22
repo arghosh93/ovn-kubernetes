@@ -233,4 +233,197 @@ var _ = ginkgo.XDescribe("IP Rule Manager", func() {
 			}).WithTimeout(time.Second).Should(gomega.Succeed())
 		})
 	})
+
+	ginkgo.Context("AddRules batch", func() {
+		ginkgo.It("ensure multiple rules exist when added in batch", func() {
+			var _, testIPNet2, _ = net.ParseCIDR("192.168.2.5/24")
+			var _, testIPNet3, _ = net.ParseCIDR("192.168.3.5/24")
+
+			ruleWithDst2 := netlink.NewRule()
+			ruleWithDst2.Priority = 3001
+			ruleWithDst2.Table = 254
+			ruleWithDst2.Dst = testIPNet2
+
+			ruleWithDst3 := netlink.NewRule()
+			ruleWithDst3.Priority = 3002
+			ruleWithDst3.Table = 254
+			ruleWithDst3.Dst = testIPNet3
+
+			rules := []netlink.Rule{*ruleWithDst, *ruleWithDst2, *ruleWithDst3}
+
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.AddRules(rules)
+				})
+			}()).Should(gomega.Succeed())
+
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					existingRules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst.String())
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst2); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst2.String())
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst3); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst3.String())
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("handles empty slice without error", func() {
+			rules := []netlink.Rule{}
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.AddRules(rules)
+				})
+			}()).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("deduplicates when adding same rule multiple times in batch", func() {
+			rules := []netlink.Rule{*ruleWithDst, *ruleWithDst}
+
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.AddRules(rules)
+				})
+			}()).Should(gomega.Succeed())
+
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					existingRules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					// Count how many times the rule appears
+					count := 0
+					for _, r := range existingRules {
+						if areNetlinkRulesEqual(&r, ruleWithDst) {
+							count++
+						}
+					}
+					if count != 1 {
+						return fmt.Errorf("expected rule to appear once, but found %d times", count)
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("deduplicates when rule already managed via Add()", func() {
+			// Add one rule via Add()
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.Add(*ruleWithDst)
+				})
+			}()).Should(gomega.Succeed())
+
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					rules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					if ok, _ := isNetlinkRuleInSlice(rules, ruleWithDst); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst.String())
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+
+			// Now add the same rule via AddRules()
+			rules := []netlink.Rule{*ruleWithDst, *ruleWithSrc}
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.AddRules(rules)
+				})
+			}()).Should(gomega.Succeed())
+
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					existingRules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					// Both rules should exist
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst); !ok {
+						return fmt.Errorf("failed to find rule with dst")
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithSrc); !ok {
+						return fmt.Errorf("failed to find rule with src")
+					}
+					// Check ruleWithDst appears only once
+					count := 0
+					for _, r := range existingRules {
+						if areNetlinkRulesEqual(&r, ruleWithDst) {
+							count++
+						}
+					}
+					if count != 1 {
+						return fmt.Errorf("expected ruleWithDst to appear once, but found %d times", count)
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+		})
+
+		ginkgo.It("ensure batch-added rules are restored if removed", func() {
+			var _, testIPNet2, _ = net.ParseCIDR("192.168.2.5/24")
+			ruleWithDst2 := netlink.NewRule()
+			ruleWithDst2.Priority = 3001
+			ruleWithDst2.Table = 254
+			ruleWithDst2.Dst = testIPNet2
+
+			rules := []netlink.Rule{*ruleWithDst, *ruleWithDst2}
+
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return c.AddRules(rules)
+				})
+			}()).Should(gomega.Succeed())
+
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					existingRules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst.String())
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst2); !ok {
+						return fmt.Errorf("failed to find rule %q", ruleWithDst2.String())
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+
+			// Delete one of the batch-added rules
+			gomega.Expect(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					return netlink.RuleDel(ruleWithDst)
+				})
+			}()).Should(gomega.Succeed())
+
+			// Check that rule is restored by the controller
+			gomega.Eventually(func() error {
+				return testNS.Do(func(ns.NetNS) error {
+					existingRules, err := netlink.RuleList(netlink.FAMILY_ALL)
+					if err != nil {
+						return err
+					}
+					if ok, _ := isNetlinkRuleInSlice(existingRules, ruleWithDst); !ok {
+						return fmt.Errorf("failed to find restored rule %q", ruleWithDst.String())
+					}
+					return nil
+				})
+			}).WithTimeout(time.Second).Should(gomega.Succeed())
+		})
+	})
 })
